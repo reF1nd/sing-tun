@@ -404,9 +404,6 @@ func (t *NativeTun) FrontHeadroom() int {
 }
 
 func (t *NativeTun) BatchSize() int {
-	if !t.vnetHdr {
-		return 1
-	}
 	/* // Not works on some devices: https://github.com/SagerNet/sing-box/issues/1605
 	batchSize := int(gsoMaxSize/t.options.MTU) * 2
 	if batchSize > idealBatchSize {
@@ -417,6 +414,20 @@ func (t *NativeTun) BatchSize() int {
 }
 
 func (t *NativeTun) BatchRead(buffers [][]byte, offset int, readN []int) (n int, err error) {
+	if !t.vnetHdr {
+		t.readAccess.Lock()
+		defer t.readAccess.Unlock()
+		readBuf := buffers[0][offset:]
+		n, err = t.tunFile.Read(readBuf)
+		if err != nil {
+			if errors.Is(err, syscall.EBADFD) {
+				err = os.ErrClosed
+			}
+			return 0, err
+		}
+		readN[0] = n
+		return 1, nil
+	}
 	t.readAccess.Lock()
 	defer t.readAccess.Unlock()
 	n, err = t.tunFile.Read(t.writeBuffer)
@@ -429,8 +440,12 @@ func (t *NativeTun) BatchRead(buffers [][]byte, offset int, readN []int) (n int,
 func (t *NativeTun) BatchWrite(buffers [][]byte, offset int) (int, error) {
 	t.writeAccess.Lock()
 	defer func() {
-		t.tcpGROTable.reset()
-		t.udpGROTable.reset()
+		if t.tcpGROTable != nil {
+			t.tcpGROTable.reset()
+		}
+		if t.udpGROTable != nil {
+			t.udpGROTable.reset()
+		}
 		t.writeAccess.Unlock()
 	}()
 	var (

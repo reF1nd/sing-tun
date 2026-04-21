@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/sagernet/nftables"
 	"github.com/sagernet/sing/common"
@@ -65,8 +66,6 @@ func NewAutoRedirect(options AutoRedirectOptions) (AutoRedirect, error) {
 func (r *autoRedirect) Start() error {
 	var err error
 	if runtime.GOOS == "android" {
-		r.enableIPv4 = true
-		r.iptablesPath = "/system/bin/iptables"
 		userId := os.Getuid()
 		if userId != 0 {
 			r.androidSu = true
@@ -82,6 +81,18 @@ func (r *autoRedirect) Start() error {
 			}
 			if err != nil {
 				return E.Extend(E.Cause(err, "root permission is required for auto redirect"), os.Getenv("PATH"))
+			}
+		}
+		if len(r.tunOptions.Inet4Address) > 0 {
+			r.enableIPv4 = true
+			r.iptablesPath = "/system/bin/iptables"
+		}
+		if len(r.tunOptions.Inet6Address) > 0 {
+			if androidIPv6NATSupported(r.androidSu, r.suPath) {
+				r.enableIPv6 = true
+				r.ip6tablesPath = "/system/bin/ip6tables"
+			} else {
+				r.logger.Warn("ip6tables nat not supported by kernel, IPv6 redirect disabled")
 			}
 		}
 	} else {
@@ -121,7 +132,11 @@ func (r *autoRedirect) Start() error {
 	if r.customRedirectPort == 0 {
 		var listenAddr netip.Addr
 		if runtime.GOOS == "android" {
-			listenAddr = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+			if r.enableIPv6 {
+				listenAddr = netip.IPv6Loopback()
+			} else {
+				listenAddr = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+			}
 		} else if r.enableIPv6 {
 			listenAddr = netip.IPv6Unspecified()
 		} else {
@@ -242,4 +257,27 @@ func (r *autoRedirect) effectiveNFQueue() uint16 {
 
 func (r *autoRedirect) shouldSkipOutputChain() bool {
 	return len(r.tunOptions.IncludeInterface) > 0 && !common.Contains(r.tunOptions.IncludeInterface, "lo") || common.Contains(r.tunOptions.ExcludeInterface, "lo")
+}
+
+func androidIPv6NATSupported(useSu bool, suPath string) bool {
+	var data []byte
+	if useSu {
+		out, err := exec.Command(suPath, "-c", "/system/bin/cat /proc/net/ip6_tables_names").Output()
+		if err != nil {
+			return false
+		}
+		data = out
+	} else {
+		var err error
+		data, err = os.ReadFile("/proc/net/ip6_tables_names")
+		if err != nil {
+			return false
+		}
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "nat" {
+			return true
+		}
+	}
+	return false
 }

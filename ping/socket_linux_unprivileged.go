@@ -15,6 +15,8 @@ import (
 	"github.com/sagernet/sing/common/pipe"
 )
 
+const maxUnprivilegedConnMappings = 1024
+
 type UnprivilegedConn struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -24,7 +26,27 @@ type UnprivilegedConn struct {
 	receiveChan   chan *unprivilegedResponse
 	readDeadline  pipe.Deadline
 	mappingAccess sync.Mutex
-	mapping       map[uint16]net.Conn
+	mapping       map[uint16]*unprivilegedConnEntry
+}
+
+type unprivilegedConnEntry struct {
+	conn      *net.UDPConn
+	lastUsed  time.Time
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// close ends the entry's response goroutine, including a send blocked on a
+// reader that stopped reading, and closes its socket.
+func (e *unprivilegedConnEntry) close() {
+	e.closeOnce.Do(func() {
+		if e.done != nil {
+			close(e.done)
+		}
+		if e.conn != nil {
+			_ = e.conn.Close()
+		}
+	})
 }
 
 type unprivilegedResponse struct {
@@ -48,7 +70,7 @@ func newUnprivilegedConn(ctx context.Context, controlFunc control.Func, destinat
 		idleTimeout:  idleTimeout,
 		receiveChan:  make(chan *unprivilegedResponse),
 		readDeadline: pipe.MakeDeadline(),
-		mapping:      make(map[uint16]net.Conn),
+		mapping:      make(map[uint16]*unprivilegedConnEntry),
 	}, nil
 }
 
@@ -97,26 +119,71 @@ func (c *UnprivilegedConn) Write(b []byte) (n int, err error) {
 		c.mappingAccess.Unlock()
 		return 0, err
 	}
-	conn, loaded := c.mapping[identifier]
+	now := time.Now()
+	c.pruneExpiredMappingsLocked(now)
+	entry, loaded := c.mapping[identifier]
 	if !loaded {
+		c.evictOldestMappingLocked()
+		var conn net.Conn
 		conn, err = connect(false, c.controlFunc, c.destination)
 		if err != nil {
 			c.mappingAccess.Unlock()
 			return
 		}
-		go c.fetchResponse(conn.(*net.UDPConn), identifier)
-		c.mapping[identifier] = conn
+		udpConn := conn.(*net.UDPConn)
+		entry = &unprivilegedConnEntry{
+			conn:     udpConn,
+			lastUsed: now,
+			done:     make(chan struct{}),
+		}
+		go c.fetchResponse(entry, identifier)
+		c.mapping[identifier] = entry
+	} else {
+		entry.lastUsed = now
 	}
 	c.mappingAccess.Unlock()
-	n, err = conn.Write(b)
+	n, err = entry.conn.Write(b)
 	if err != nil {
-		c.removeConn(conn.(*net.UDPConn), identifier)
+		c.removeConn(entry, identifier)
 	}
 	return
 }
 
-func (c *UnprivilegedConn) fetchResponse(conn *net.UDPConn, identifier uint16) {
-	defer c.removeConn(conn, identifier)
+func (c *UnprivilegedConn) pruneExpiredMappingsLocked(now time.Time) {
+	if c.idleTimeout <= 0 {
+		return
+	}
+	for identifier, entry := range c.mapping {
+		if now.Sub(entry.lastUsed) > c.idleTimeout {
+			delete(c.mapping, identifier)
+			entry.close()
+		}
+	}
+}
+
+func (c *UnprivilegedConn) evictOldestMappingLocked() {
+	for len(c.mapping) >= maxUnprivilegedConnMappings {
+		var (
+			oldestIdentifier uint16
+			oldestEntry      *unprivilegedConnEntry
+		)
+		for identifier, entry := range c.mapping {
+			if oldestEntry == nil || entry.lastUsed.Before(oldestEntry.lastUsed) {
+				oldestIdentifier = identifier
+				oldestEntry = entry
+			}
+		}
+		if oldestEntry == nil {
+			return
+		}
+		delete(c.mapping, oldestIdentifier)
+		oldestEntry.close()
+	}
+}
+
+func (c *UnprivilegedConn) fetchResponse(entry *unprivilegedConnEntry, identifier uint16) {
+	defer c.removeConn(entry, identifier)
+	conn := entry.conn
 	for {
 		if c.idleTimeout > 0 {
 			err := conn.SetReadDeadline(time.Now().Add(c.idleTimeout))
@@ -153,26 +220,29 @@ func (c *UnprivilegedConn) fetchResponse(conn *net.UDPConn, identifier uint16) {
 			buffer.Release()
 			cmsgBuffer.Release()
 			return
+		case <-entry.done:
+			buffer.Release()
+			cmsgBuffer.Release()
+			return
 		}
 	}
 }
 
-func (c *UnprivilegedConn) removeConn(conn *net.UDPConn, identifier uint16) {
+func (c *UnprivilegedConn) removeConn(entry *unprivilegedConnEntry, identifier uint16) {
 	c.mappingAccess.Lock()
-	mappedConn, loaded := c.mapping[identifier]
-	if loaded && mappedConn == conn {
+	if c.mapping[identifier] == entry {
 		delete(c.mapping, identifier)
 	}
 	c.mappingAccess.Unlock()
-	_ = conn.Close()
+	entry.close()
 }
 
 func (c *UnprivilegedConn) Close() error {
 	c.mappingAccess.Lock()
 	defer c.mappingAccess.Unlock()
 	c.cancel()
-	for _, conn := range c.mapping {
-		_ = conn.Close()
+	for _, entry := range c.mapping {
+		entry.close()
 	}
 	clear(c.mapping)
 	return nil

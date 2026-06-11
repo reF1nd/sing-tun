@@ -323,6 +323,11 @@ func (m *Mixed) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 		pkt.DecRef()
 	case header.ICMPv6ProtocolNumber:
 		writeBack, err = m.processIPv6ICMP(ipHdr, ipHdr.Payload())
+	default:
+		transportProto, payload, fragment, transportPresent := skipIPv6ExtensionHeaders(uint8(ipHdr.TransportProtocol()), ipHdr.Payload())
+		if !fragment && transportPresent && transportProto == uint8(header.ICMPv6ProtocolNumber) {
+			writeBack, err = m.processIPv6ICMP(ipHdr, payload)
+		}
 	}
 	return
 }

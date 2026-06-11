@@ -703,9 +703,17 @@ func (e *goEngine) processFrame(frame *goFrame) {
 	e.processParsed(frame.buffer, frame.meta, &parsed)
 }
 
+func (e *goEngine) isLocalICMPEchoRequest(parsed *forwardPacket) bool {
+	return (parsed.ipVersion == 4 && parsed.protocol == uint8(header.ICMPv4ProtocolNumber) && parsed.icmpType == uint8(header.ICMPv4Echo) && slices.Contains(e.stack.inet4LocalAddresses, parsed.destination.Addr())) ||
+		(parsed.ipVersion == 6 && parsed.protocol == uint8(header.ICMPv6ProtocolNumber) && parsed.icmpType == uint8(header.ICMPv6EchoRequest) && slices.Contains(e.stack.inet6LocalAddresses, parsed.destination.Addr()))
+}
+
 func (e *goEngine) hasLocalEndpoint(parsed *forwardPacket) bool {
 	if !parsed.hasFlow {
 		return false
+	}
+	if e.isLocalICMPEchoRequest(parsed) {
+		return true
 	}
 	switch parsed.protocol {
 	case uint8(header.TCPProtocolNumber):
@@ -739,6 +747,11 @@ func (e *goEngine) processParsed(buffer *buf.Buffer, meta ForwardFrameMeta, pars
 		return
 	}
 	if e.dispatchStage != nil && e.dispatchStage.ReturnParsed(packet, meta, parsed) {
+		return
+	}
+	// Local TUN and virtual DNS echo requests must not enter flow routing.
+	if e.isLocalICMPEchoRequest(parsed) {
+		e.answerEcho(packet, parsed)
 		return
 	}
 	if parsed.protocol == uint8(header.UDPProtocolNumber) && parsed.hasFlow {

@@ -1,0 +1,667 @@
+package tun
+
+import (
+	"encoding/binary"
+	"net/netip"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/sagernet/sing-tun/gtcpip/header"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/logger"
+
+	"github.com/stretchr/testify/require"
+)
+
+type localICMPTestHandler struct {
+	Handler
+	judged atomic.Int32
+}
+
+func (h *localICMPTestHandler) JudgeFlow(uint8, netip.AddrPort, netip.AddrPort, []byte) FlowVerdict {
+	h.judged.Add(1)
+	return FlowVerdict{Action: ActionDrop}
+}
+
+// Flow judgment runs asynchronously, so wait for the pending verdict.
+func requireLocalICMPJudged(t *testing.T, handler *localICMPTestHandler) {
+	require.Eventually(t, func() bool {
+		return handler.judged.Load() == 1
+	}, time.Second, time.Millisecond)
+}
+
+type localICMPTestIO struct {
+	goPlatformIO
+	packets [][]byte
+}
+
+func (p *localICMPTestIO) writeDatagram(packet []byte, _ ForwardFrameMeta) error {
+	p.packets = append(p.packets, append([]byte(nil), packet...))
+	return nil
+}
+
+func (p *localICMPTestIO) flush() {}
+
+func TestLocalICMPEchoBeforeFlowRouting(t *testing.T) {
+	for _, stackName := range []string{"go", "system"} {
+		for _, ipv6 := range []bool{false, true} {
+			family := "IPv4"
+			prefix := netip.MustParsePrefix("172.18.0.1/29")
+			external := netip.MustParseAddr("8.8.8.8")
+			if ipv6 {
+				family = "IPv6"
+				prefix = netip.MustParsePrefix("fdfe:dcba:9876::1/125")
+				external = netip.MustParseAddr("2001:4860:4860::8888")
+			}
+			for _, test := range []struct {
+				name        string
+				destination netip.Addr
+				customDNS   bool
+				disabled    bool
+				local       bool
+			}{
+				{"TUN address", prefix.Addr(), false, false, true},
+				{"default DNS", prefix.Addr().Next(), false, false, true},
+				{"custom DNS", prefix.Addr().Next().Next(), true, false, true},
+				{"external DNS", external, true, false, false},
+				{"disabled DNS", prefix.Addr().Next(), false, true, false},
+				{"disabled custom DNS", prefix.Addr().Next().Next(), true, true, false},
+				{"TUN address with DNS disabled", prefix.Addr(), false, true, true},
+				{"ordinary destination", prefix.Addr().Next().Next(), false, false, false},
+			} {
+				t.Run(stackName+"/"+family+"/"+test.name, func(t *testing.T) {
+					options := Options{AutoRoute: true}
+					if ipv6 {
+						options.Inet6Address = []netip.Prefix{prefix}
+					} else {
+						options.Inet4Address = []netip.Prefix{prefix}
+					}
+					if test.customDNS {
+						options.DNSAddress = []netip.Addr{test.destination}
+					}
+					if test.disabled {
+						options.DNSMode = DNSModeDisabled
+					}
+					source := prefix.Addr().Next().Next().Next()
+					packet := buildICMPv4EchoPacket
+					if ipv6 {
+						packet = buildICMPv6EchoPacket
+					}
+					raw := packet(source, test.destination)
+					handler := &localICMPTestHandler{}
+					dispatcher := NewForwardDispatcher(handler, nil, nil, 0, UDPNatOptions{}, 0)
+					defer dispatcher.Close()
+					stackOptions := StackOptions{TunOptions: options, Handler: handler}
+					var replied bool
+					if stackName == "go" {
+						stackOptions.Tun = &MemoryTun{}
+						stack, err := NewGo(stackOptions)
+						require.NoError(t, err)
+						platformIO := &localICMPTestIO{}
+						engine := &goEngine{
+							stack: stack, platformIO: platformIO,
+							dispatchStage: dispatcher.NewStage(nil, func() {}),
+						}
+						buffer := buf.NewSize(32 + len(raw))
+						defer buffer.Release()
+						buffer.Resize(32, len(raw))
+						copy(buffer.Bytes(), raw)
+						engine.processFrame(&goFrame{buffer: buffer})
+						replied = len(platformIO.packets) > 0
+						if replied {
+							require.Len(t, platformIO.packets, 1)
+							raw = platformIO.packets[0]
+						}
+					} else {
+						stack, err := NewSystem(stackOptions)
+						require.NoError(t, err)
+						system := stack.(*System)
+						system.dispatchStage = dispatcher.NewStage(nil, func() {})
+						replied = system.processPacket(raw)
+					}
+					require.Equal(t, test.local, replied)
+					if !test.local {
+						requireLocalICMPJudged(t, handler)
+						return
+					}
+					require.Zero(t, handler.judged.Load())
+					if ipv6 {
+						ipHdr := header.IPv6(raw)
+						icmpHdr := header.ICMPv6(ipHdr.Payload())
+						require.Equal(t, test.destination, ipHdr.SourceAddr())
+						require.Equal(t, source, ipHdr.DestinationAddr())
+						require.Equal(t, header.ICMPv6EchoReply, icmpHdr.Type())
+						require.Equal(t, header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+							Header: icmpHdr, Src: test.destination.AsSlice(), Dst: source.AsSlice(),
+						}), icmpHdr.Checksum())
+					} else {
+						ipHdr := header.IPv4(raw)
+						icmpHdr := header.ICMPv4(ipHdr.Payload())
+						require.Equal(t, test.destination, ipHdr.SourceAddr())
+						require.Equal(t, source, ipHdr.DestinationAddr())
+						require.Equal(t, header.ICMPv4EchoReply, icmpHdr.Type())
+						require.Equal(t, header.ICMPv4Checksum(icmpHdr, 0), icmpHdr.Checksum())
+						require.Equal(t, ^ipHdr.CalculateChecksum(), ipHdr.Checksum())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestGoLocalICMPErrorReachesSocket(t *testing.T) {
+	for _, prefix := range []netip.Prefix{
+		netip.MustParsePrefix("172.18.0.1/29"),
+		netip.MustParsePrefix("fdfe:dcba:9876::1/125"),
+	} {
+		for _, address := range []netip.Addr{prefix.Addr(), prefix.Addr().Next()} {
+			t.Run(address.String(), func(t *testing.T) {
+				options := Options{AutoRoute: true}
+				if address.Is4() {
+					options.Inet4Address = []netip.Prefix{prefix}
+				} else {
+					options.Inet6Address = []netip.Prefix{prefix}
+				}
+				stack, err := NewGo(StackOptions{Tun: &MemoryTun{}, TunOptions: options})
+				require.NoError(t, err)
+				local := netip.AddrPortFrom(address, 40000)
+				remote := netip.AddrPortFrom(prefix.Addr().Next().Next().Next(), 9000)
+				socket := &GoUDPConn{local: local, remote: remote, connected: true, readSignal: make(goSignal, 1)}
+				platformIO := &localICMPTestIO{}
+				engine := &goEngine{
+					stack: stack, platformIO: platformIO,
+					udpSockets: map[netip.AddrPort]*GoUDPConn{local: socket},
+				}
+				// Quote an outbound UDP packet in an ICMP port-unreachable reply.
+				ipVersion := goIPVersion(address)
+				outgoing := make([]byte, goNetworkHeaderLength(ipVersion)+header.UDPMinimumSize)
+				goEncodeUDPPacket(outgoing, ipVersion, local, remote, nil, 1)
+				parsed, ok := parseForwardPacket(outgoing)
+				require.True(t, ok)
+				reply, ok := buildReject(&parsed, 0)
+				require.True(t, ok)
+				buffer := buf.As(reply)
+				engine.processFrame(&goFrame{buffer: buffer})
+				require.ErrorIs(t, socket.pendingErr, syscall.ECONNREFUSED)
+				require.Empty(t, platformIO.packets)
+			})
+		}
+	}
+}
+
+func TestSystemRespondsToDefaultIPv4DNSEcho(t *testing.T) {
+	system := &System{}
+
+	packet := buildICMPv4EchoPacket(netip.MustParseAddr("172.18.0.1"), netip.MustParseAddr("172.18.0.2"))
+	ipHdr := header.IPv4(packet)
+	icmpHdr := header.ICMPv4(ipHdr.Payload())
+
+	writeBack, err := system.processIPv4ICMP(ipHdr, icmpHdr)
+	require.NoError(t, err)
+	require.True(t, writeBack)
+	require.Equal(t, netip.MustParseAddr("172.18.0.2"), ipHdr.SourceAddr())
+	require.Equal(t, netip.MustParseAddr("172.18.0.1"), ipHdr.DestinationAddr())
+	require.Equal(t, header.ICMPv4EchoReply, icmpHdr.Type())
+}
+
+func TestSystemRespondsToDefaultIPv6DNSEcho(t *testing.T) {
+	system := &System{}
+
+	packet := buildICMPv6EchoPacket(netip.MustParseAddr("fdfe:dcba:9876::1"), netip.MustParseAddr("fdfe:dcba:9876::2"))
+	ipHdr := header.IPv6(packet)
+	icmpHdr := header.ICMPv6(ipHdr.Payload())
+
+	writeBack, err := system.processIPv6ICMP(ipHdr, icmpHdr)
+	require.NoError(t, err)
+	require.True(t, writeBack)
+	require.Equal(t, netip.MustParseAddr("fdfe:dcba:9876::2"), ipHdr.SourceAddr())
+	require.Equal(t, netip.MustParseAddr("fdfe:dcba:9876::1"), ipHdr.DestinationAddr())
+	require.Equal(t, header.ICMPv6EchoReply, icmpHdr.Type())
+}
+
+func TestLocalDNSServerAddresses(t *testing.T) {
+	inet4Prefix := netip.MustParsePrefix("172.18.0.1/29")
+	inet6Prefix := netip.MustParsePrefix("fdfe:dcba:9876::1/125")
+	tests := []struct {
+		name      string
+		options   Options
+		wantInet4 []netip.Addr
+		wantInet6 []netip.Addr
+	}{
+		{
+			name: "default disabled without auto route",
+			options: Options{
+				Inet4Address: []netip.Prefix{inet4Prefix},
+				Inet6Address: []netip.Prefix{inet6Prefix},
+			},
+		},
+		{
+			name: "default",
+			options: Options{
+				AutoRoute:    true,
+				Inet4Address: []netip.Prefix{inet4Prefix},
+				Inet6Address: []netip.Prefix{inet6Prefix},
+			},
+			wantInet4: []netip.Addr{netip.MustParseAddr("172.18.0.2")},
+			wantInet6: []netip.Addr{netip.MustParseAddr("fdfe:dcba:9876::2")},
+		},
+		{
+			name: "custom addresses in TUN prefixes",
+			options: Options{
+				AutoRoute:    true,
+				Inet4Address: []netip.Prefix{inet4Prefix},
+				Inet6Address: []netip.Prefix{inet6Prefix},
+				DNSAddress: []netip.Addr{
+					netip.MustParseAddr("172.18.0.3"),
+					netip.MustParseAddr("fdfe:dcba:9876::3"),
+				},
+			},
+			wantInet4: []netip.Addr{netip.MustParseAddr("172.18.0.3")},
+			wantInet6: []netip.Addr{netip.MustParseAddr("fdfe:dcba:9876::3")},
+		},
+		{
+			name: "external custom addresses",
+			options: Options{
+				AutoRoute:    true,
+				Inet4Address: []netip.Prefix{inet4Prefix},
+				Inet6Address: []netip.Prefix{inet6Prefix},
+				DNSAddress: []netip.Addr{
+					netip.MustParseAddr("8.8.8.8"),
+					netip.MustParseAddr("2001:4860:4860::8888"),
+				},
+			},
+		},
+		{
+			name: "disabled",
+			options: Options{
+				AutoRoute:    true,
+				Inet4Address: []netip.Prefix{inet4Prefix},
+				Inet6Address: []netip.Prefix{inet6Prefix},
+				DNSMode:      DNSModeDisabled,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			inet4Addresses, inet6Addresses := localDNSServerAddresses(test.options)
+			require.Equal(t, test.wantInet4, inet4Addresses)
+			require.Equal(t, test.wantInet6, inet6Addresses)
+		})
+	}
+}
+
+func buildICMPv4EchoPacket(source netip.Addr, destination netip.Addr) []byte {
+	packet := make([]byte, header.IPv4MinimumSize+header.ICMPv4MinimumSize)
+	ipHdr := header.IPv4(packet)
+	ipHdr.Encode(&header.IPv4Fields{
+		TotalLength: uint16(len(packet)),
+		Protocol:    uint8(header.ICMPv4ProtocolNumber),
+		SrcAddr:     source,
+		DstAddr:     destination,
+		TTL:         64,
+	})
+	icmpHdr := header.ICMPv4(ipHdr.Payload())
+	icmpHdr.SetType(header.ICMPv4Echo)
+	icmpHdr.SetIdent(1)
+	icmpHdr.SetSequence(1)
+	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
+	ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
+	return packet
+}
+
+func buildICMPv6EchoPacket(source netip.Addr, destination netip.Addr) []byte {
+	packet := make([]byte, header.IPv6MinimumSize+header.ICMPv6MinimumSize)
+	ipHdr := header.IPv6(packet)
+	ipHdr.Encode(&header.IPv6Fields{
+		PayloadLength:     header.ICMPv6MinimumSize,
+		TransportProtocol: header.ICMPv6ProtocolNumber,
+		HopLimit:          64,
+		SrcAddr:           source,
+		DstAddr:           destination,
+	})
+	icmpHdr := header.ICMPv6(ipHdr.Payload())
+	icmpHdr.SetType(header.ICMPv6EchoRequest)
+	icmpHdr.SetIdent(1)
+	icmpHdr.SetSequence(1)
+	icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+		Header: icmpHdr,
+		Src:    source.AsSlice(),
+		Dst:    destination.AsSlice(),
+	}))
+	return packet
+}
+
+type returnCaptureWriteback struct {
+	ForwardWriteback
+	packets [][]byte
+}
+
+func (*returnCaptureWriteback) ReturnHeadroom() int { return 0 }
+
+func (w *returnCaptureWriteback) WriteReturnPackets(packets [][]byte) error {
+	for _, packet := range packets {
+		w.packets = append(w.packets, append([]byte(nil), packet...))
+	}
+	return nil
+}
+
+type returnTestHandler struct {
+	Handler
+	port Port
+}
+
+func (h *returnTestHandler) JudgeFlow(uint8, netip.AddrPort, netip.AddrPort, []byte) FlowVerdict {
+	return FlowVerdict{Action: ActionFlow, Port: h.port}
+}
+
+// returnTestPort is a routed port whose return path is attached to another
+// dispatcher, as a TUN stack serving flows forwarded from an endpoint.
+type returnTestPort struct {
+	target  *ForwardDispatcher
+	written [][]byte
+}
+
+func (*returnTestPort) RoutedPort() {}
+
+func (*returnTestPort) PortAddresses() (netip.Addr, netip.Addr) {
+	return netip.MustParseAddr("198.18.0.1"), netip.MustParseAddr("fdfe:dcba:9877::1")
+}
+
+func (*returnTestPort) PortMTU() uint32 { return 1500 }
+
+func (p *returnTestPort) AttachReturn(returnPath Return) error {
+	return p.target.attachReturn(returnPath)
+}
+
+func (p *returnTestPort) DetachReturn(returnPath Return) error {
+	p.target.detachReturn(returnPath)
+	return nil
+}
+
+func (p *returnTestPort) WritePackets(packets [][]byte) error {
+	for _, packet := range packets {
+		p.written = append(p.written, append([]byte(nil), packet...))
+	}
+	return nil
+}
+
+// Return paths run before local echo replies: an echo request that belongs to
+// a forwarded flow is relayed to the flow owner even when it is addressed to a
+// local TUN address.
+func TestLocalICMPEchoAfterReturnPaths(t *testing.T) {
+	prefix := netip.MustParsePrefix("172.18.0.1/29")
+	local := prefix.Addr()
+	remote := netip.MustParseAddr("192.0.2.10")
+	other := netip.MustParseAddr("192.0.2.11")
+	handler := &localICMPTestHandler{}
+	stackDispatcher := NewForwardDispatcher(handler, nil, nil, 0, UDPNatOptions{}, 0)
+	defer stackDispatcher.Close()
+	port := &returnTestPort{target: stackDispatcher}
+	owner := NewForwardDispatcher(&returnTestHandler{port: port}, nil, logger.NOP(), 0, UDPNatOptions{}, time.Minute)
+	defer owner.Close()
+	ownerWriteback := &returnCaptureWriteback{}
+	ownerStage := owner.NewStage(ownerWriteback, func() {})
+
+	// A flow from the local address to the remote one installs the return mapping.
+	require.True(t, ownerStage.Dispatch(buildICMPv4EchoPacket(local, remote)))
+	require.Eventually(t, func() bool {
+		ownerStage.access.Lock()
+		defer ownerStage.access.Unlock()
+		return len(ownerStage.judged) > 0
+	}, time.Second, time.Millisecond)
+	ownerStage.ResumeJudged(func([]byte, ForwardFrameMeta) {})
+	ownerStage.Flush()
+	require.Len(t, port.written, 1)
+
+	stack, err := NewGo(StackOptions{
+		TunOptions: Options{AutoRoute: true, Inet4Address: []netip.Prefix{prefix}},
+		Handler:    handler,
+		Tun:        &MemoryTun{},
+	})
+	require.NoError(t, err)
+	platformIO := &localICMPTestIO{}
+	engine := &goEngine{stack: stack, platformIO: platformIO, dispatchStage: stackDispatcher.NewStage(nil, func() {})}
+	process := func(raw []byte) {
+		buffer := buf.NewSize(32 + len(raw))
+		defer buffer.Release()
+		buffer.Resize(32, len(raw))
+		copy(buffer.Bytes(), raw)
+		engine.processFrame(&goFrame{buffer: buffer})
+		engine.dispatchStage.Flush()
+	}
+
+	process(buildICMPv4EchoPacket(remote, local))
+	require.Empty(t, platformIO.packets, "echo request of a forwarded flow was answered locally")
+	require.Len(t, ownerWriteback.packets, 1)
+
+	process(buildICMPv4EchoPacket(other, local))
+	require.Len(t, platformIO.packets, 1)
+	require.Len(t, ownerWriteback.packets, 1)
+	require.Zero(t, handler.judged.Load())
+}
+
+func buildFragmentedICMPv4EchoPackets(source netip.Addr, destination netip.Addr, id uint16, payload []byte) [][]byte {
+	full := make([]byte, header.ICMPv4MinimumSize+len(payload))
+	icmpHdr := header.ICMPv4(full)
+	icmpHdr.SetType(header.ICMPv4Echo)
+	icmpHdr.SetIdent(1)
+	icmpHdr.SetSequence(1)
+	copy(full[header.ICMPv4MinimumSize:], payload)
+	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
+
+	split := 16 // multiple of 8, >= ICMPv4MinimumSize
+	first := make([]byte, header.IPv4MinimumSize+split)
+	firstIP := header.IPv4(first)
+	firstIP.Encode(&header.IPv4Fields{
+		TotalLength: uint16(len(first)),
+		ID:          id,
+		Flags:       header.IPv4FlagMoreFragments,
+		Protocol:    uint8(header.ICMPv4ProtocolNumber),
+		SrcAddr:     source,
+		DstAddr:     destination,
+		TTL:         64,
+	})
+	copy(firstIP.Payload(), full[:split])
+	firstIP.SetChecksum(^firstIP.CalculateChecksum())
+
+	second := make([]byte, header.IPv4MinimumSize+len(full)-split)
+	secondIP := header.IPv4(second)
+	secondIP.Encode(&header.IPv4Fields{
+		TotalLength:    uint16(len(second)),
+		ID:             id,
+		FragmentOffset: uint16(split),
+		Protocol:       uint8(header.ICMPv4ProtocolNumber),
+		SrcAddr:        source,
+		DstAddr:        destination,
+		TTL:            64,
+	})
+	copy(secondIP.Payload(), full[split:])
+	secondIP.SetChecksum(^secondIP.CalculateChecksum())
+	return [][]byte{first, second}
+}
+
+func buildFragmentedICMPv6EchoPackets(source netip.Addr, destination netip.Addr, id uint32, payload []byte) [][]byte {
+	full := make([]byte, header.ICMPv6MinimumSize+len(payload))
+	icmpHdr := header.ICMPv6(full)
+	icmpHdr.SetType(header.ICMPv6EchoRequest)
+	icmpHdr.SetIdent(1)
+	icmpHdr.SetSequence(1)
+	copy(full[header.ICMPv6MinimumSize:], payload)
+	icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+		Header: icmpHdr,
+		Src:    source.AsSlice(),
+		Dst:    destination.AsSlice(),
+	}))
+
+	split := 16 // multiple of 8, >= ICMPv6MinimumSize
+	buildFrag := func(offset uint16, more bool, chunk []byte) []byte {
+		packet := make([]byte, header.IPv6MinimumSize+header.IPv6FragmentHeaderSize+len(chunk))
+		ipHdr := header.IPv6(packet)
+		ipHdr.Encode(&header.IPv6Fields{
+			PayloadLength:     uint16(header.IPv6FragmentHeaderSize + len(chunk)),
+			TransportProtocol: header.IPv6FragmentHeader,
+			HopLimit:          64,
+			SrcAddr:           source,
+			DstAddr:           destination,
+		})
+		fragHdr := ipHdr.Payload()
+		fragHdr[0] = uint8(header.ICMPv6ProtocolNumber)
+		fragHdr[1] = 0
+		offsetFlags := offset &^ 0x7
+		if more {
+			offsetFlags |= 1
+		}
+		binary.BigEndian.PutUint16(fragHdr[2:4], offsetFlags)
+		binary.BigEndian.PutUint32(fragHdr[4:8], id)
+		copy(fragHdr[header.IPv6FragmentHeaderSize:], chunk)
+		return packet
+	}
+	return [][]byte{
+		buildFrag(0, true, full[:split]),
+		buildFrag(uint16(split), false, full[split:]),
+	}
+}
+
+func TestLocalICMPEchoFragmented(t *testing.T) {
+	payload := []byte("fragmented-icmp-echo-payload-data")
+	for _, profile := range []BufferProfile{BufferProfileDefault, BufferProfileCompact, BufferProfileFull} {
+		for _, ipv6 := range []bool{false, true} {
+			family := "IPv4"
+			prefix := netip.MustParsePrefix("172.18.0.1/29")
+			external := netip.MustParseAddr("8.8.8.8")
+			if ipv6 {
+				family = "IPv6"
+				prefix = netip.MustParsePrefix("fdfe:dcba:9876::1/125")
+				external = netip.MustParseAddr("2001:4860:4860::8888")
+			}
+			source := prefix.Addr().Next().Next().Next()
+			dnsAddr := prefix.Addr().Next()
+			t.Run(family, func(t *testing.T) {
+				handler := &localICMPTestHandler{}
+				dispatcher := NewForwardDispatcher(handler, nil, nil, 0, UDPNatOptions{}, 0)
+				defer dispatcher.Close()
+				options := Options{AutoRoute: true}
+				if ipv6 {
+					options.Inet6Address = []netip.Prefix{prefix}
+				} else {
+					options.Inet4Address = []netip.Prefix{prefix}
+				}
+				stack, err := NewGo(StackOptions{Tun: &MemoryTun{}, TunOptions: options, Handler: handler, BufferProfile: profile})
+				require.NoError(t, err)
+				platformIO := &localICMPTestIO{}
+				engine := newGoEngine(stack, platformIO, 1)
+				engine.dispatchStage = dispatcher.NewStage(nil, func() {})
+				feed := func(raw []byte) {
+					buffer := buf.NewSize(32 + len(raw))
+					defer buffer.Release()
+					buffer.Resize(32, len(raw))
+					copy(buffer.Bytes(), raw)
+					engine.processFrame(&goFrame{buffer: buffer})
+					engine.dispatchStage.Flush()
+				}
+
+				// Local virtual DNS fragmented echo must bypass JudgeFlow and reply once after reassembly.
+				var localFrags [][]byte
+				if ipv6 {
+					localFrags = buildFragmentedICMPv6EchoPackets(source, dnsAddr, 0x101, payload)
+				} else {
+					localFrags = buildFragmentedICMPv4EchoPackets(source, dnsAddr, 0x101, payload)
+				}
+				for _, frag := range localFrags {
+					feed(frag)
+				}
+				require.Zero(t, handler.judged.Load())
+				require.Len(t, platformIO.packets, 1)
+				reply := platformIO.packets[0]
+				if ipv6 {
+					ipHdr := header.IPv6(reply)
+					icmpHdr := header.ICMPv6(ipHdr.Payload())
+					require.Equal(t, dnsAddr, ipHdr.SourceAddr())
+					require.Equal(t, source, ipHdr.DestinationAddr())
+					require.Equal(t, header.ICMPv6EchoReply, icmpHdr.Type())
+					require.Equal(t, payload, icmpHdr.Payload())
+					require.Equal(t, header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+						Header: icmpHdr, Src: dnsAddr.AsSlice(), Dst: source.AsSlice(),
+					}), icmpHdr.Checksum())
+				} else {
+					ipHdr := header.IPv4(reply)
+					icmpHdr := header.ICMPv4(ipHdr.Payload())
+					require.Equal(t, dnsAddr, ipHdr.SourceAddr())
+					require.Equal(t, source, ipHdr.DestinationAddr())
+					require.Equal(t, header.ICMPv4EchoReply, icmpHdr.Type())
+					require.Equal(t, payload, icmpHdr.Payload())
+					require.Equal(t, header.ICMPv4Checksum(icmpHdr, 0), icmpHdr.Checksum())
+					require.Equal(t, ^ipHdr.CalculateChecksum(), ipHdr.Checksum())
+				}
+
+				// External fragmented echo must still be routed to JudgeFlow on the first
+				// fragment, resume cleanly through processResumed, and drop without replying.
+				var extFrags [][]byte
+				if ipv6 {
+					extFrags = buildFragmentedICMPv6EchoPackets(source, external, 0x202, payload)
+				} else {
+					extFrags = buildFragmentedICMPv4EchoPackets(source, external, 0x202, payload)
+				}
+				feed(extFrags[0])
+				requireLocalICMPJudged(t, handler)
+				require.Eventually(t, func() bool {
+					engine.dispatchStage.access.Lock()
+					defer engine.dispatchStage.access.Unlock()
+					return len(engine.dispatchStage.judged) > 0
+				}, time.Second, time.Millisecond)
+				engine.dispatchStage.ResumeJudged(engine.processResumed)
+				for _, frag := range extFrags[1:] {
+					feed(frag)
+				}
+				engine.dispatchStage.ResumeJudged(engine.processResumed)
+				require.Len(t, platformIO.packets, 1)
+			})
+		}
+	}
+
+	// Return path must still win over local echo for fragmented packets.
+	prefix := netip.MustParsePrefix("172.18.0.1/29")
+	local := prefix.Addr()
+	remote := netip.MustParseAddr("192.0.2.10")
+	handler := &localICMPTestHandler{}
+	stackDispatcher := NewForwardDispatcher(handler, nil, nil, 0, UDPNatOptions{}, 0)
+	defer stackDispatcher.Close()
+	port := &returnTestPort{target: stackDispatcher}
+	owner := NewForwardDispatcher(&returnTestHandler{port: port}, nil, logger.NOP(), 0, UDPNatOptions{}, time.Minute)
+	defer owner.Close()
+	ownerWriteback := &returnCaptureWriteback{}
+	ownerStage := owner.NewStage(ownerWriteback, func() {})
+
+	require.True(t, ownerStage.Dispatch(buildICMPv4EchoPacket(local, remote)))
+	require.Eventually(t, func() bool {
+		ownerStage.access.Lock()
+		defer ownerStage.access.Unlock()
+		return len(ownerStage.judged) > 0
+	}, time.Second, time.Millisecond)
+	ownerStage.ResumeJudged(func([]byte, ForwardFrameMeta) {})
+	ownerStage.Flush()
+	require.Len(t, port.written, 1)
+
+	stack, err := NewGo(StackOptions{
+		TunOptions: Options{AutoRoute: true, Inet4Address: []netip.Prefix{prefix}},
+		Handler:    handler,
+		Tun:        &MemoryTun{},
+	})
+	require.NoError(t, err)
+	platformIO := &localICMPTestIO{}
+	engine := newGoEngine(stack, platformIO, 1)
+	engine.dispatchStage = stackDispatcher.NewStage(nil, func() {})
+	for _, frag := range buildFragmentedICMPv4EchoPackets(remote, local, 0x303, payload) {
+		buffer := buf.NewSize(32 + len(frag))
+		buffer.Resize(32, len(frag))
+		copy(buffer.Bytes(), frag)
+		engine.processFrame(&goFrame{buffer: buffer})
+		engine.dispatchStage.Flush()
+		buffer.Release()
+	}
+	require.Empty(t, platformIO.packets)
+	require.Len(t, ownerWriteback.packets, 2)
+	require.Zero(t, handler.judged.Load())
+}

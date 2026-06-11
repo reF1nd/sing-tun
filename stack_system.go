@@ -35,6 +35,8 @@ type System struct {
 	inet4NextAddress     netip.Addr
 	inet6Address         netip.Addr
 	inet6NextAddress     netip.Addr
+	inet4LocalAddresses  []netip.Addr
+	inet6LocalAddresses  []netip.Addr
 	broadcastAddr        netip.Addr
 	inet4LoopbackAddress []netip.Addr
 	inet6LoopbackAddress []netip.Addr
@@ -86,6 +88,7 @@ func NewSystem(options StackOptions) (Stack, error) {
 		}
 		stack.inet4Address = options.TunOptions.Inet4Address[0].Addr()
 		stack.inet4NextAddress = stack.inet4Address.Next()
+		stack.inet4LocalAddresses = appendAddress(stack.inet4LocalAddresses, stack.inet4Address)
 	}
 	if len(options.TunOptions.Inet6Address) > 0 {
 		if !HasNextAddress(options.TunOptions.Inet6Address[0], 1) {
@@ -93,9 +96,17 @@ func NewSystem(options StackOptions) (Stack, error) {
 		}
 		stack.inet6Address = options.TunOptions.Inet6Address[0].Addr()
 		stack.inet6NextAddress = stack.inet6Address.Next()
+		stack.inet6LocalAddresses = appendAddress(stack.inet6LocalAddresses, stack.inet6Address)
 	}
 	if !stack.inet4NextAddress.IsValid() && !stack.inet6NextAddress.IsValid() {
 		return nil, E.New("missing interface address")
+	}
+	inet4DNSAddresses, inet6DNSAddresses := localDNSServerAddresses(options.TunOptions)
+	for _, address := range inet4DNSAddresses {
+		stack.inet4LocalAddresses = appendAddress(stack.inet4LocalAddresses, address)
+	}
+	for _, address := range inet6DNSAddresses {
+		stack.inet6LocalAddresses = appendAddress(stack.inet6LocalAddresses, address)
 	}
 	return stack, nil
 }
@@ -642,7 +653,7 @@ func (s *System) processIPv4ICMP(ipHdr header.IPv4, icmpHdr header.ICMPv4) (bool
 	}
 	sourceAddr := ipHdr.SourceAddr()
 	destinationAddr := ipHdr.DestinationAddr()
-	if destinationAddr != s.inet4Address {
+	if !common.Contains(s.inet4LocalAddresses, destinationAddr) {
 		action, err := s.directNat.Lookup(DirectRouteSession{Source: sourceAddr, Destination: destinationAddr}, func(timeout time.Duration) (DirectRouteDestination, error) {
 			return s.handler.PrepareConnection(
 				N.NetworkICMP,
@@ -717,7 +728,7 @@ func (s *System) processIPv6ICMP(ipHdr header.IPv6, icmpHdr header.ICMPv6) (bool
 	}
 	sourceAddr := ipHdr.SourceAddr()
 	destinationAddr := ipHdr.DestinationAddr()
-	if destinationAddr != s.inet6Address {
+	if !common.Contains(s.inet6LocalAddresses, destinationAddr) {
 		action, err := s.directNat.Lookup(DirectRouteSession{Source: sourceAddr, Destination: destinationAddr}, func(timeout time.Duration) (DirectRouteDestination, error) {
 			return s.handler.PrepareConnection(
 				N.NetworkICMP,

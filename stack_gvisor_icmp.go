@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -25,13 +26,13 @@ import (
 )
 
 type ICMPForwarder struct {
-	ctx          context.Context
-	stack        *stack.Stack
-	logger       logger.Logger
-	inet4Address netip.Addr
-	inet6Address netip.Addr
-	handler      Handler
-	mapping      *DirectRouteMapping
+	ctx            context.Context
+	stack          *stack.Stack
+	logger         logger.Logger
+	inet4Addresses []netip.Addr
+	inet6Addresses []netip.Addr
+	handler        Handler
+	mapping        *DirectRouteMapping
 }
 
 func NewICMPForwarder(
@@ -50,9 +51,9 @@ func NewICMPForwarder(
 	}
 }
 
-func (f *ICMPForwarder) SetLocalAddresses(inet4Address, inet6Address netip.Addr) {
-	f.inet4Address = inet4Address
-	f.inet6Address = inet6Address
+func (f *ICMPForwarder) SetLocalAddresses(inet4Addresses, inet6Addresses []netip.Addr) {
+	f.inet4Addresses = inet4Addresses
+	f.inet6Addresses = inet6Addresses
 }
 
 func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
@@ -64,7 +65,7 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 		}
 		sourceAddr := M.AddrFromIP(ipHdr.SourceAddressSlice())
 		destinationAddr := M.AddrFromIP(ipHdr.DestinationAddressSlice())
-		if destinationAddr != f.inet4Address {
+		if !common.Contains(f.inet4Addresses, destinationAddr) {
 			action, err := f.mapping.Lookup(DirectRouteSession{Source: sourceAddr, Destination: destinationAddr}, func(timeout time.Duration) (DirectRouteDestination, error) {
 				return f.handler.PrepareConnection(
 					N.NetworkICMP,
@@ -127,7 +128,7 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 		}
 		sourceAddr := M.AddrFromIP(ipHdr.SourceAddressSlice())
 		destinationAddr := M.AddrFromIP(ipHdr.DestinationAddressSlice())
-		if destinationAddr != f.inet6Address {
+		if !common.Contains(f.inet6Addresses, destinationAddr) {
 			action, err := f.mapping.Lookup(DirectRouteSession{Source: sourceAddr, Destination: destinationAddr}, func(timeout time.Duration) (DirectRouteDestination, error) {
 				return f.handler.PrepareConnection(
 					N.NetworkICMP,

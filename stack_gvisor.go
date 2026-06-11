@@ -31,6 +31,8 @@ type GVisor struct {
 	tun                  GVisorTun
 	inet4Address         netip.Addr
 	inet6Address         netip.Addr
+	inet4LocalAddresses  []netip.Addr
+	inet6LocalAddresses  []netip.Addr
 	inet4LoopbackAddress []netip.Addr
 	inet6LoopbackAddress []netip.Addr
 	udpTimeout           time.Duration
@@ -66,12 +68,23 @@ func NewGVisor(
 	if len(options.TunOptions.Inet6Address) > 0 {
 		inet6Address = options.TunOptions.Inet6Address[0].Addr()
 	}
+	inet4LocalAddresses := appendAddress(nil, inet4Address)
+	inet6LocalAddresses := appendAddress(nil, inet6Address)
+	inet4DNSAddresses, inet6DNSAddresses := localDNSServerAddresses(options.TunOptions)
+	for _, address := range inet4DNSAddresses {
+		inet4LocalAddresses = appendAddress(inet4LocalAddresses, address)
+	}
+	for _, address := range inet6DNSAddresses {
+		inet6LocalAddresses = appendAddress(inet6LocalAddresses, address)
+	}
 
 	gStack := &GVisor{
 		ctx:                  options.Context,
 		tun:                  gTun,
 		inet4Address:         inet4Address,
 		inet6Address:         inet6Address,
+		inet4LocalAddresses:  inet4LocalAddresses,
+		inet6LocalAddresses:  inet6LocalAddresses,
 		inet4LoopbackAddress: options.TunOptions.Inet4LoopbackAddress,
 		inet6LoopbackAddress: options.TunOptions.Inet6LoopbackAddress,
 		udpTimeout:           options.UDPTimeout,
@@ -96,7 +109,7 @@ func (t *GVisor) Start() error {
 	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, NewTCPForwarderWithLoopback(t.ctx, ipStack, t.handler, t.inet4LoopbackAddress, t.inet6LoopbackAddress, t.tun).HandlePacket)
 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, NewUDPForwarder(t.ctx, ipStack, t.handler, t.udpTimeout).HandlePacket)
 	icmpForwarder := NewICMPForwarder(t.ctx, ipStack, t.logger, t.handler, t.icmpTimeout)
-	icmpForwarder.SetLocalAddresses(t.inet4Address, t.inet6Address)
+	icmpForwarder.SetLocalAddresses(t.inet4LocalAddresses, t.inet6LocalAddresses)
 	ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
 	ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber6, icmpForwarder.HandlePacket)
 	t.stack = ipStack

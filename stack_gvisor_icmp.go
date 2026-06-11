@@ -16,14 +16,17 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 )
 
 type ICMPForwarder struct {
-	stack   *stack.Stack
-	handler Handler
-	logger  logger.Logger
+	stack          *stack.Stack
+	handler        Handler
+	logger         logger.Logger
+	inet4Addresses []netip.Addr
+	inet6Addresses []netip.Addr
 
 	returnPath icmpForwarderReturn
 
@@ -81,6 +84,11 @@ func (f *ICMPForwarder) Purge() {
 	f.flowAccess.Unlock()
 }
 
+func (f *ICMPForwarder) SetLocalAddresses(inet4Addresses, inet6Addresses []netip.Addr) {
+	f.inet4Addresses = inet4Addresses
+	f.inet6Addresses = inet6Addresses
+}
+
 func (f *ICMPForwarder) Close() error {
 	f.returnPath.closed.Store(true)
 	f.flowAccess.Lock()
@@ -103,27 +111,30 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 		if icmpHdr.Type() != header.ICMPv4Echo || icmpHdr.Code() != 0 {
 			return false
 		}
-		identifier := icmpHdr.Ident()
-		key := icmpFlowKey{
-			source:      AddrFromAddress(ipHdr.SourceAddress()),
-			destination: AddrFromAddress(ipHdr.DestinationAddress()),
-			identifier:  identifier,
-		}
-		if f.forwardCached(key, pkt) {
-			return true
-		}
-		verdict := f.handler.JudgeFlow(
-			uint8(header.ICMPv4ProtocolNumber),
-			netip.AddrPortFrom(key.source, identifier),
-			netip.AddrPortFrom(key.destination, identifier),
-			nil,
-		)
-		switch verdict.Action {
-		case ActionReject, ActionDrop:
-			return true
-		case ActionFlow:
-			if f.installFlow(key, verdict, pkt) {
+		destination := AddrFromAddress(ipHdr.DestinationAddress())
+		if !common.Contains(f.inet4Addresses, destination) {
+			identifier := icmpHdr.Ident()
+			key := icmpFlowKey{
+				source:      AddrFromAddress(ipHdr.SourceAddress()),
+				destination: destination,
+				identifier:  identifier,
+			}
+			if f.forwardCached(key, pkt) {
 				return true
+			}
+			verdict := f.handler.JudgeFlow(
+				uint8(header.ICMPv4ProtocolNumber),
+				netip.AddrPortFrom(key.source, identifier),
+				netip.AddrPortFrom(key.destination, identifier),
+				nil,
+			)
+			switch verdict.Action {
+			case ActionReject, ActionDrop:
+				return true
+			case ActionFlow:
+				if f.installFlow(key, verdict, pkt) {
+					return true
+				}
 			}
 		}
 		icmpHdr.SetType(header.ICMPv4EchoReply)
@@ -164,28 +175,31 @@ func (f *ICMPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 			// reply on behalf of arbitrary forwarded destinations.
 			return true
 		}
-		identifier := icmpHdr.Ident()
-		key := icmpFlowKey{
-			v6:          true,
-			source:      AddrFromAddress(ipHdr.SourceAddress()),
-			destination: AddrFromAddress(ipHdr.DestinationAddress()),
-			identifier:  identifier,
-		}
-		if f.forwardCached(key, pkt) {
-			return true
-		}
-		verdict := f.handler.JudgeFlow(
-			uint8(header.ICMPv6ProtocolNumber),
-			netip.AddrPortFrom(key.source, identifier),
-			netip.AddrPortFrom(key.destination, identifier),
-			nil,
-		)
-		switch verdict.Action {
-		case ActionReject, ActionDrop:
-			return true
-		case ActionFlow:
-			if f.installFlow(key, verdict, pkt) {
+		destination := AddrFromAddress(ipHdr.DestinationAddress())
+		if !common.Contains(f.inet6Addresses, destination) {
+			identifier := icmpHdr.Ident()
+			key := icmpFlowKey{
+				v6:          true,
+				source:      AddrFromAddress(ipHdr.SourceAddress()),
+				destination: destination,
+				identifier:  identifier,
+			}
+			if f.forwardCached(key, pkt) {
 				return true
+			}
+			verdict := f.handler.JudgeFlow(
+				uint8(header.ICMPv6ProtocolNumber),
+				netip.AddrPortFrom(key.source, identifier),
+				netip.AddrPortFrom(key.destination, identifier),
+				nil,
+			)
+			switch verdict.Action {
+			case ActionReject, ActionDrop:
+				return true
+			case ActionFlow:
+				if f.installFlow(key, verdict, pkt) {
+					return true
+				}
 			}
 		}
 		icmpHdr.SetType(header.ICMPv6EchoReply)

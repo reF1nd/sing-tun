@@ -372,10 +372,22 @@ func (s *ForwardStage) judgeAndInstall(key flowKey, packet *forwardPacket, raw [
 	if verdict.Action == ActionBypass && verdict.Port != nil {
 		verdict.Action = ActionFlow
 	}
-	s.access.Lock()
-	defer s.access.Unlock()
+	for attempt := 0; ; attempt++ {
+		s.access.Lock()
+		handled, exhausted := s.installVerdictLocked(key, packet, raw, meta, verdict, attempt == 0)
+		s.access.Unlock()
+		if !exhausted {
+			return handled
+		}
+		// Do not hold a stage lock while collecting entries owned by other queues.
+		d.reclaimNAT(verdict.Port)
+	}
+}
+
+func (s *ForwardStage) installVerdictLocked(key flowKey, packet *forwardPacket, raw []byte, meta *ForwardFrameMeta, verdict FlowVerdict, retry bool) (handled, exhausted bool) {
+	d := s.dispatcher
 	if d.returnPath.closed.Load() {
-		return false
+		return false, false
 	}
 	now := d.now()
 	existing, loaded := s.table[key]
@@ -387,7 +399,7 @@ func (s *ForwardStage) judgeAndInstall(key flowKey, packet *forwardPacket, raw [
 			if remove {
 				s.removeEntry(key, existing, FlowCloseReset)
 			}
-			return handled
+			return handled, false
 		}
 	}
 	switch verdict.Action {
@@ -399,37 +411,40 @@ func (s *ForwardStage) judgeAndInstall(key flowKey, packet *forwardPacket, raw [
 				entry.deadline = now + int64(entry.idle)
 				s.insertEntry(key, entry, now)
 				s.forwardToPort(flow, packet, raw, meta)
-				return true
+				return true, false
 			}
 			if result == createFlowExhausted {
+				if retry {
+					return false, true
+				}
 				if now-s.exhaustedLogAt >= int64(exhaustedLogInterval) {
 					s.exhaustedLogAt = now
 					d.logger.Warn("port selector range exhausted, rejecting flow to ", packet.destination)
 				}
-				s.installSimple(key, ActionReject, packet.protocol, now)
+				// Capacity can return before the next SYN; do not cache a route rejection.
 				s.stageReject(packet, raw, meta)
-				return true
+				return true, false
 			}
 		}
 		s.installAccept(key, packet, verdict, now)
-		return false
+		return false, false
 	case ActionReject:
 		s.installSimple(key, ActionReject, packet.protocol, now)
 		s.stageReject(packet, raw, meta)
-		return true
+		return true, false
 	case ActionDrop:
 		s.installSimple(key, ActionDrop, packet.protocol, now)
-		return true
+		return true, false
 	case ActionHijackDNS:
 		if packet.protocol == uint8(header.UDPProtocolNumber) {
 			d.hijackDNSPacket(packet)
-			return true
+			return true, false
 		}
 		s.installAccept(key, packet, verdict, now)
-		return false
+		return false, false
 	default:
 		s.installAccept(key, packet, verdict, now)
-		return false
+		return false, false
 	}
 }
 
@@ -787,7 +802,36 @@ func (s *ForwardStage) removeEntry(key flowKey, entry *flowEntry, reason FlowClo
 			reason = FlowCloseFinished
 		}
 		entry.flow.close(reason)
-		entry.flow.nat.delete(entry.flow.reverseKey)
+		entry.flow.nat.delete(entry.flow.reverseKey, entry.flow)
+	}
+}
+
+// reclaimNAT is used only after allocation failed. Preserve live mappings and
+// forward tombstones, but release closed or expired reverse mappings so that
+// a busy queue does not have to wait for every other queue's periodic sweep.
+func (d *ForwardDispatcher) reclaimNAT(port Port) {
+	d.stagesAccess.Lock()
+	stages := append([]*ForwardStage(nil), d.stages...)
+	d.stagesAccess.Unlock()
+	for _, stage := range stages {
+		stage.access.Lock()
+		now := d.now()
+		for key, entry := range stage.table {
+			flow := entry.flow
+			if flow == nil || flow.nat.port != port {
+				continue
+			}
+			if entryExpired(entry, now) {
+				stage.removeEntry(key, entry, FlowCloseTimeout)
+			} else if flow.closed.Load() {
+				if entry.action == ActionFlow {
+					tombstoneEntry(entry, now)
+				}
+				flow.nat.delete(flow.reverseKey, flow)
+				entry.flow = nil
+			}
+		}
+		stage.access.Unlock()
 	}
 }
 

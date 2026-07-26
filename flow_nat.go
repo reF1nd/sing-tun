@@ -70,10 +70,12 @@ func (n *portNAT) insert(key flowKey, flow *forwardFlow) {
 	shard.access.Unlock()
 }
 
-func (n *portNAT) delete(key flowKey) {
+func (n *portNAT) delete(key flowKey, flow *forwardFlow) {
 	shard := n.shard(key)
 	shard.access.Lock()
-	delete(shard.flows, key)
+	if shard.flows[key] == flow {
+		delete(shard.flows, key)
+	}
 	shard.access.Unlock()
 }
 

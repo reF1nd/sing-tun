@@ -23,9 +23,11 @@ type tcpNatKey struct {
 
 type TCPSession struct {
 	sync.Mutex
-	Source      netip.AddrPort
-	Destination netip.AddrPort
-	LastActive  time.Time
+	Source            netip.AddrPort
+	Destination       netip.AddrPort
+	LastActive        time.Time
+	activeConnections int
+	lastClosed        time.Time
 }
 
 func NewNat(ctx context.Context, timeout time.Duration) *TCPNat {
@@ -98,10 +100,10 @@ func (n *TCPNat) Purge() {
 func (n *TCPNat) LookupBack(port uint16) *TCPSession {
 	n.portAccess.RLock()
 	session := n.portMap[port]
-	n.portAccess.RUnlock()
 	if session != nil {
 		session.refresh()
 	}
+	n.portAccess.RUnlock()
 	return session
 }
 
@@ -116,10 +118,40 @@ func (s *TCPSession) refresh() {
 func (n *TCPNat) refresh(port uint16) {
 	n.portAccess.RLock()
 	session := n.portMap[port]
-	n.portAccess.RUnlock()
 	if session != nil {
 		session.refresh()
 	}
+	n.portAccess.RUnlock()
+}
+
+func (n *TCPNat) acquire(port uint16) *TCPSession {
+	n.portAccess.RLock()
+	session := n.portMap[port]
+	if session != nil {
+		session.Lock()
+		session.activeConnections++
+		session.LastActive = time.Now()
+		session.Unlock()
+	}
+	n.portAccess.RUnlock()
+	return session
+}
+
+func (n *TCPNat) release(port uint16, session *TCPSession) {
+	n.portAccess.RLock()
+	if n.portMap[port] == session {
+		session.Lock()
+		if session.activeConnections > 0 {
+			session.activeConnections--
+			if session.activeConnections == 0 {
+				now := time.Now()
+				session.LastActive = now
+				session.lastClosed = now
+			}
+		}
+		session.Unlock()
+	}
+	n.portAccess.RUnlock()
 }
 
 func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) uint16 {
@@ -140,7 +172,7 @@ func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) uint1
 	}
 	n.portAccess.Lock()
 	defer n.portAccess.Unlock()
-	nextPort, ok := n.allocatePortLocked()
+	nextPort, ok := n.allocatePortLocked(time.Now())
 	if !ok {
 		return 0
 	}
@@ -153,7 +185,15 @@ func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) uint1
 	return nextPort
 }
 
-func (n *TCPNat) allocatePortLocked() (uint16, bool) {
+func (n *TCPNat) allocatePortLocked(now time.Time) (uint16, bool) {
+	var (
+		closedPort uint16
+		closedAt   time.Time
+		closedKey  tcpNatKey
+	)
+	// Prefer an unused or expired port. A recently closed port is only
+	// reclaimed after the entire selector space has been exhausted, preserving
+	// the normal timeout grace period for delayed packets.
 	for range 65535 - 10000 + 1 {
 		nextPort := n.portIndex
 		if nextPort == 0 {
@@ -162,9 +202,31 @@ func (n *TCPNat) allocatePortLocked() (uint16, bool) {
 		} else {
 			n.portIndex++
 		}
-		if _, occupied := n.portMap[nextPort]; !occupied {
+		session, occupied := n.portMap[nextPort]
+		if !occupied {
 			return nextPort, true
 		}
+		session.Lock()
+		expired := now.Sub(session.LastActive) > n.timeout
+		if !expired && session.activeConnections == 0 && !session.lastClosed.IsZero() &&
+			(closedAt.IsZero() || session.LastActive.Before(closedAt)) {
+			closedPort = nextPort
+			closedAt = session.LastActive
+			closedKey = tcpNatKey{Source: session.Source, Destination: session.Destination}
+		}
+		if expired {
+			delete(n.addrMap, tcpNatKey{Source: session.Source, Destination: session.Destination})
+			delete(n.portMap, nextPort)
+		}
+		session.Unlock()
+		if expired {
+			return nextPort, true
+		}
+	}
+	if !closedAt.IsZero() {
+		delete(n.addrMap, closedKey)
+		delete(n.portMap, closedPort)
+		return closedPort, true
 	}
 	return 0, false
 }

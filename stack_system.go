@@ -414,13 +414,21 @@ func (s *System) acceptLoop(listener net.Listener) {
 		} else {
 			tcpNat = s.tcpNat6
 		}
-		session := tcpNat.LookupBack(remoteAddr.Port)
+		session := tcpNat.acquire(remoteAddr.Port)
 		if session == nil {
 			s.logger.Trace(E.New("unknown session with port ", remoteAddr.Port))
 			_ = conn.Close()
 			continue
 		}
-		go s.handler.NewConnectionEx(s.ctx, conn, M.SocksaddrFromNetIP(session.Source), M.SocksaddrFromNetIP(session.Destination), nil)
+		go s.handler.NewConnectionEx(
+			s.ctx,
+			conn,
+			M.SocksaddrFromNetIP(session.Source),
+			M.SocksaddrFromNetIP(session.Destination),
+			N.OnceClose(func(error) {
+				tcpNat.release(remoteAddr.Port, session)
+			}),
+		)
 	}
 }
 

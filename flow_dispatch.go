@@ -307,7 +307,7 @@ func (d *ForwardDispatcher) judgeAndInstall(key flowKey, packet *forwardPacket, 
 					d.exhaustedLogAt = now
 					d.logger.Warn("port selector range exhausted, rejecting flow to ", packet.destination)
 				}
-				d.installSimple(key, ActionReject, packet.protocol, now)
+				// Capacity can return before the next SYN; do not cache a route rejection.
 				d.stageReject(packet)
 				return true
 			}
@@ -407,7 +407,11 @@ func (d *ForwardDispatcher) createFlow(packet *forwardPacket, verdict FlowVerdic
 	}
 	selector, reverseKey, allocated := nat.allocateSelector(packet.protocol, portAddress, serverAddress, serverPort, packet.source.Port())
 	if !allocated {
-		return nil, createFlowExhausted
+		d.reclaimNAT(nat)
+		selector, reverseKey, allocated = nat.allocateSelector(packet.protocol, portAddress, serverAddress, serverPort, packet.source.Port())
+		if !allocated {
+			return nil, createFlowExhausted
+		}
 	}
 	var udpTimeout time.Duration
 	if packet.protocol == uint8(header.UDPProtocolNumber) {
@@ -643,7 +647,29 @@ func (d *ForwardDispatcher) removeEntry(key flowKey, entry *flowEntry, reason Fl
 			reason = FlowCloseFinished
 		}
 		entry.flow.close(reason)
-		entry.flow.nat.delete(entry.flow.reverseKey)
+		entry.flow.nat.delete(entry.flow.reverseKey, entry.flow)
+	}
+}
+
+// reclaimNAT runs on the dispatch path only after selector allocation fails.
+// Keep live mappings and forward tombstones, but release closed or expired
+// reverse mappings without waiting for the periodic, bounded sweep.
+func (d *ForwardDispatcher) reclaimNAT(nat *portNAT) {
+	now := d.now()
+	for key, entry := range d.table {
+		flow := entry.flow
+		if flow == nil || flow.nat != nat {
+			continue
+		}
+		if d.entryExpired(entry, now) {
+			d.removeEntry(key, entry, FlowCloseTimeout)
+		} else if flow.closed.Load() {
+			if entry.action == ActionFlow {
+				d.tombstoneEntry(entry, now)
+			}
+			flow.nat.delete(flow.reverseKey, flow)
+			entry.flow = nil
+		}
 	}
 }
 

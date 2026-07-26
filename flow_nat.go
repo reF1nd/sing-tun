@@ -22,8 +22,11 @@ type portNAT struct {
 	selectorStart uint16
 	selectorCount uint16
 
-	counter uint32
-	pending [][]byte
+	counter               uint32
+	active                bool
+	pending               [][]byte
+	pendingFlows          []*forwardFlow
+	pendingFlushOnReclaim []bool
 }
 
 type natShard struct {
@@ -70,10 +73,12 @@ func (n *portNAT) insert(key flowKey, flow *forwardFlow) {
 	shard.access.Unlock()
 }
 
-func (n *portNAT) delete(key flowKey) {
+func (n *portNAT) delete(key flowKey, flow *forwardFlow) {
 	shard := n.shard(key)
 	shard.access.Lock()
-	delete(shard.flows, key)
+	if shard.flows[key] == flow {
+		delete(shard.flows, key)
+	}
 	shard.access.Unlock()
 }
 
@@ -118,4 +123,51 @@ func (n *portNAT) allocateSelector(protocol uint8, portAddress, serverAddress ne
 		}
 	}
 	return 0, flowKey{}, false
+}
+
+func (n *portNAT) pendingForFlushOnReclaim(flow *forwardFlow) [][]byte {
+	if len(n.pending) == 0 {
+		return nil
+	}
+	hasFlush := false
+	for i, pendingFlow := range n.pendingFlows {
+		if pendingFlow == flow && n.pendingFlushOnReclaim[i] {
+			hasFlush = true
+			break
+		}
+	}
+	if !hasFlush {
+		return nil
+	}
+	var flushPackets [][]byte
+	for i, pendingFlow := range n.pendingFlows {
+		if pendingFlow == flow {
+			flushPackets = append(flushPackets, n.pending[i])
+		}
+	}
+	return flushPackets
+}
+
+func (n *portNAT) dropPending(flow *forwardFlow) {
+	if len(n.pending) == 0 {
+		return
+	}
+	kept := 0
+	for i, pendingFlow := range n.pendingFlows {
+		if pendingFlow == flow {
+			continue
+		}
+		n.pending[kept] = n.pending[i]
+		n.pendingFlows[kept] = pendingFlow
+		n.pendingFlushOnReclaim[kept] = n.pendingFlushOnReclaim[i]
+		kept++
+	}
+	if kept < len(n.pending) {
+		clear(n.pending[kept:])
+		clear(n.pendingFlows[kept:])
+		clear(n.pendingFlushOnReclaim[kept:])
+		n.pending = n.pending[:kept]
+		n.pendingFlows = n.pendingFlows[:kept]
+		n.pendingFlushOnReclaim = n.pendingFlushOnReclaim[:kept]
+	}
 }

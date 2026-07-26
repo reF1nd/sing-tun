@@ -49,8 +49,9 @@ func (d *ForwardDispatcher) resegmentTCP(flow *forwardFlow, packet *forwardPacke
 		d.logger.Trace(E.Cause(err, "resegment packet"))
 		return
 	}
+	flushOnReclaim := packet.tcpFlags&header.TCPFlagRst != 0
 	for i := range n {
-		d.stagePort(flow.nat, bufs[i][:sizes[i]])
+		d.stagePort(flow, bufs[i][:sizes[i]], flushOnReclaim)
 	}
 }
 

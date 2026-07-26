@@ -306,7 +306,7 @@ func (d *ForwardDispatcher) judgeAndInstall(key flowKey, packet *forwardPacket, 
 					d.exhaustedLogAt = now
 					d.logger.Warn("port selector range exhausted, rejecting flow to ", packet.destination)
 				}
-				d.installSimple(key, ActionReject, packet.protocol, now)
+				// Capacity can return before the next SYN; do not cache a route rejection.
 				d.stageReject(packet)
 				return true
 			}
@@ -409,7 +409,11 @@ func (d *ForwardDispatcher) createFlow(packet *forwardPacket, verdict FlowVerdic
 	}
 	selector, reverseKey, allocated := nat.allocateSelector(packet.protocol, portAddress, serverAddress, serverPort, packet.source.Port())
 	if !allocated {
-		return nil, createFlowExhausted
+		d.reclaimNAT(nat)
+		selector, reverseKey, allocated = nat.allocateSelector(packet.protocol, portAddress, serverAddress, serverPort, packet.source.Port())
+		if !allocated {
+			return nil, createFlowExhausted
+		}
 	}
 	var udpTimeout time.Duration
 	if packet.protocol == uint8(header.UDPProtocolNumber) {
@@ -517,7 +521,7 @@ func (d *ForwardDispatcher) forwardToPort(flow *forwardFlow, packet *forwardPack
 				fragments, ok := fragmentIPv4Packet(ipHdr, flow.effectiveMTU)
 				if ok {
 					for _, fragment := range fragments {
-						d.stagePort(flow.nat, fragment)
+						d.stagePort(flow, fragment, false)
 					}
 				}
 				return
@@ -538,7 +542,8 @@ func (d *ForwardDispatcher) forwardToPort(flow *forwardFlow, packet *forwardPack
 		flow.tracker.CountForward(len(raw))
 	}
 	d.rewriteForward(flow, packet)
-	d.stagePort(flow.nat, raw)
+	flushOnReclaim := packet.protocol == uint8(header.TCPProtocolNumber) && packet.tcpFlags&header.TCPFlagRst != 0
+	d.stagePort(flow, raw, flushOnReclaim)
 }
 
 func (d *ForwardDispatcher) rewriteForward(flow *forwardFlow, packet *forwardPacket) {
@@ -551,14 +556,32 @@ func (d *ForwardDispatcher) rewriteForward(flow *forwardFlow, packet *forwardPac
 	}
 }
 
-func (d *ForwardDispatcher) stagePort(nat *portNAT, packet []byte) {
-	if len(nat.pending) == 0 {
+func (d *ForwardDispatcher) stagePort(flow *forwardFlow, packet []byte, flushOnReclaim bool) {
+	nat := flow.nat
+	if !nat.active {
+		nat.active = true
 		d.activeNATs = append(d.activeNATs, nat)
 	}
 	nat.pending = append(nat.pending, packet)
+	nat.pendingFlows = append(nat.pendingFlows, flow)
+	nat.pendingFlushOnReclaim = append(nat.pendingFlushOnReclaim, flushOnReclaim)
+}
+
+func (d *ForwardDispatcher) reclaimFlowPending(flow *forwardFlow) bool {
+	flushPackets := flow.nat.pendingForFlushOnReclaim(flow)
+	if len(flushPackets) > 0 {
+		err := flow.nat.port.WritePackets(flushPackets)
+		if err != nil {
+			d.logger.Trace(E.Cause(err, "forward packets"))
+			return false
+		}
+	}
+	flow.nat.dropPending(flow)
+	return true
 }
 
 func (d *ForwardDispatcher) flushPort(nat *portNAT) {
+	nat.active = false
 	if len(nat.pending) == 0 {
 		return
 	}
@@ -566,7 +589,12 @@ func (d *ForwardDispatcher) flushPort(nat *portNAT) {
 	if err != nil {
 		d.logger.Trace(E.Cause(err, "forward packets"))
 	}
+	clear(nat.pending)
+	clear(nat.pendingFlows)
+	clear(nat.pendingFlushOnReclaim)
 	nat.pending = nat.pending[:0]
+	nat.pendingFlows = nat.pendingFlows[:0]
+	nat.pendingFlushOnReclaim = nat.pendingFlushOnReclaim[:0]
 }
 
 func (d *ForwardDispatcher) stageReject(packet *forwardPacket) {
@@ -648,7 +676,33 @@ func (d *ForwardDispatcher) removeEntry(key flowKey, entry *flowEntry, reason Fl
 			reason = FlowCloseFinished
 		}
 		entry.flow.close(reason)
-		entry.flow.nat.delete(entry.flow.reverseKey)
+		d.reclaimFlowPending(entry.flow)
+		entry.flow.nat.delete(entry.flow.reverseKey, entry.flow)
+	}
+}
+
+// reclaimNAT runs on the dispatch path only after selector allocation fails.
+// Keep live mappings and forward tombstones, but release closed or expired
+// reverse mappings without waiting for the periodic, bounded sweep.
+func (d *ForwardDispatcher) reclaimNAT(nat *portNAT) {
+	now := d.now()
+	for key, entry := range d.table {
+		flow := entry.flow
+		if flow == nil || flow.nat != nat {
+			continue
+		}
+		if d.entryExpired(entry, now) {
+			d.removeEntry(key, entry, FlowCloseTimeout)
+		} else if flow.closed.Load() {
+			if entry.action == ActionFlow {
+				d.tombstoneEntry(entry, now)
+			}
+			if !d.reclaimFlowPending(flow) {
+				continue
+			}
+			flow.nat.delete(flow.reverseKey, flow)
+			entry.flow = nil
+		}
 	}
 }
 

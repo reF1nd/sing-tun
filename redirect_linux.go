@@ -66,6 +66,7 @@ type autoRedirect struct {
 	androidVPNServiceRules       []*netlink.Rule
 	androidVPNServiceRulesActive bool
 	androidIngressDiscardValues  map[netip.Addr][8]byte
+	androidTetheringOffload      *androidTetheringOffload
 	dockerFirewallMonitor        *nftables.Monitor
 	dockerFirewallDone           chan struct{}
 	forwardingRestore            []sysctlState
@@ -108,8 +109,37 @@ func NewAutoRedirect(options AutoRedirectOptions) (AutoRedirect, error) {
 	if err != nil {
 		return nil, err
 	}
+	err = validateAutoRedirectMarks(r.tunOptions, !r.useNFTables && r.enableIPv6)
+	if err != nil {
+		return nil, err
+	}
 	r.tunOptions.AutoRedirectInputMarkMask = r.packetMarkMask(r.tunOptions.AutoRedirectInputMark)
 	return r, nil
+}
+
+func validateAutoRedirectMarks(options *Options, includeTProxy bool) error {
+	marks := []struct {
+		name  string
+		value uint32
+	}{
+		{"auto_redirect_input_mark", options.AutoRedirectInputMark},
+		{"auto_redirect_output_mark", options.AutoRedirectOutputMark},
+		{"auto_redirect_reset_mark", options.AutoRedirectResetMark},
+	}
+	if includeTProxy {
+		marks = append(marks, struct {
+			name  string
+			value uint32
+		}{"auto_redirect_tproxy_mark", options.AutoRedirectTProxyMark})
+	}
+	for i := range marks {
+		for j := i + 1; j < len(marks); j++ {
+			if marks[i].value == marks[j].value {
+				return E.New(marks[i].name, " and ", marks[j].name, " must be distinct (both resolve to ", iptablesHex(marks[i].value), ")")
+			}
+		}
+	}
+	return nil
 }
 
 func (r *autoRedirect) Start() error {
@@ -180,12 +210,21 @@ func (r *autoRedirect) Start() error {
 		return E.Cause(err, "setup iptables")
 	}
 	r.enableForwarding()
+	// Android tethering can forward packets before either CLI or VpnService
+	// redirect rules see them. Only manage filters in the redirect namespace.
+	if r.androidVPNService || (runtime.GOOS == "android" && r.enableIPv6 && r.tunOptions.NetNs == "") {
+		r.androidTetheringOffload = newAndroidTetheringOffload(r.tunOptions, r.enableIPv6, r.logger)
+	}
 	r.registerNetworkCallback(func() {
 		updateErr := r.updateIPTablesNetwork()
 		if updateErr != nil {
 			r.logger.Error(updateErr)
 		}
 	})
+	// Subscribe first so a netd change during the initial dump is revisited.
+	if err = r.updateAndroidTetheringOffload(); err != nil {
+		return E.Errors(E.Cause(err, "setup IPv6 tethering offload compatibility"), r.Close())
+	}
 	return nil
 }
 
@@ -378,6 +417,7 @@ func (r *autoRedirect) updateIPTablesNetwork() error {
 	}
 	var vpnServiceErr error
 	var bypassErr error
+	tetheringErr := r.updateAndroidTetheringOffload()
 	if r.androidVPNService {
 		vpnServiceErr = r.updateAndroidVPNServiceRules()
 		if vpnServiceErr != nil {
@@ -388,7 +428,7 @@ func (r *autoRedirect) updateIPTablesNetwork() error {
 			bypassErr = E.Cause(bypassErr, "update bypass route")
 		}
 	}
-	return E.Errors(err, routeErr, vpnServiceErr, bypassErr)
+	return E.Errors(err, routeErr, vpnServiceErr, bypassErr, tetheringErr)
 }
 
 func (r *autoRedirect) Close() error {
@@ -417,6 +457,7 @@ func (r *autoRedirect) Close() error {
 			r.cleanupBypassRoute()
 			r.cleanupAndroidVPNServiceRules()
 		}
+		err = E.Errors(err, r.cleanupAndroidTetheringOffload())
 	}
 	if r.nfqueueHandler != nil {
 		r.nfqueueHandler.Close()
@@ -472,10 +513,12 @@ func (r *autoRedirect) redirectPort() uint16 {
 // netd (server/RouteController.cpp) identifies a network's route table as
 // ifindex + ROUTE_TABLE_OFFSET_FROM_INDEX, selects VPN traffic with the
 // secure (fwmark 0x0/0x20000) and bypassable (fwmark 0x0/0x30000) uid range
-// rules, the local network with a rule matching fwmark 0x0/0x10000, and the
-// default network with a rule matching fwmark 0x0/0xffff without a uid range.
+// rules, local networks with rules at RULE_PRIORITY_LOCAL_NETWORK matching
+// fwmark 0x0/0x10000, and the default network with a rule matching fwmark
+// 0x0/0xffff without a uid range.
 const (
 	androidRouteTableOffsetFromIndex = 1000
+	androidLocalNetworkRulePriority  = 20000
 	androidExplicitSelectMask        = 0x10000
 	androidSecureVPNMask             = 0x20000
 	androidBypassableVPNMask         = 0x30000

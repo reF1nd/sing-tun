@@ -77,26 +77,34 @@ func (s *RedirectServer) Start() error {
 	if err != nil {
 		return err
 	}
-	s.listener = listener.(*net.TCPListener)
+	tcpListener := listener.(*net.TCPListener)
 	if s.packetHandler != nil {
 		var conn net.PacketConn
 		conn, err = listenConfig.ListenPacket(s.ctx, "udp6", "[::]:0")
 		if err != nil {
-			s.listener.Close()
+			tcpListener.Close()
 			return err
 		}
 		packetConn := ipv6.NewPacketConn(conn)
 		err = packetConn.SetControlMessage(ipv6.FlagDst|ipv6.FlagInterface, true)
 		if err != nil {
 			conn.Close()
-			s.listener.Close()
+			tcpListener.Close()
 			return err
 		}
 		s.packetConn = packetConn
 		go s.loopPacketIn()
 	}
-	go s.loopIn()
+	s.StartWithListener(tcpListener)
 	return nil
+}
+
+// StartWithListener takes ownership of an already listening TCP socket. This lets
+// a privileged process create the socket without moving connection handling out
+// of the process running the redirect server.
+func (s *RedirectServer) StartWithListener(listener *net.TCPListener) {
+	s.listener = listener
+	go s.loopIn()
 }
 
 func (s *RedirectServer) Port() uint16 {
@@ -154,6 +162,8 @@ func (s *RedirectServer) loopIn() {
 			return
 		}
 		retryDelay = 0
+		// FileListener cannot preserve the ListenConfig across an FD handoff.
+		_ = conn.SetKeepAliveConfig(net.KeepAliveConfig{Enable: true, Idle: 10 * time.Minute})
 		source := M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 		var destination M.Socksaddr
 		if s.transparent && !source.IsIPv4() {

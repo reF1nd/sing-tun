@@ -712,6 +712,9 @@ func (r *autoRedirect) setupIPTablesForFamily(family *iptablesFamily) error {
 			"-m", "connmark", "--mark", tproxyMark,
 			"-m", "conntrack", "--ctdir", "ORIGINAL",
 		}, tproxyAction)...)
+		// TPROXY drops a packet whose socket lookup finds a non-transparent socket,
+		// which is every reply to a connection made by a local socket.
+		preroutingTProxy.add("-m", "conntrack", "--ctdir", "REPLY", "-j", "RETURN")
 		r.iptablesAddExcludeRules(preroutingTProxy, iptablesHookPrerouting, iptablesKindNAT, dnsHijack)
 		preroutingTProxy.add("-j", "CONNMARK", "--set-xmark", tproxyMark)
 		preroutingTProxy.add(tproxyAction...)

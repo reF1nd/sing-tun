@@ -86,6 +86,13 @@ func (m *networkUpdateMonitor) Start() error {
 		}
 		return E.Cause(err, "subscribe netlink groups")
 	}
+	if runtime.GOOS == "android" {
+		// TC notifications are optional. A denied membership must not disable
+		// the existing route, rule and interface subscriptions.
+		if err := unix.SetsockoptInt(netlinkSocket, unix.SOL_NETLINK, unix.NETLINK_ADD_MEMBERSHIP, unix.RTNLGRP_TC); err != nil {
+			m.logger.Debug("TC notifications unavailable: ", err)
+		}
+	}
 	err = unix.SetsockoptInt(netlinkSocket, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, netlinkReceiveBufferSize)
 	if err != nil {
 		unix.SetsockoptInt(netlinkSocket, unix.SOL_SOCKET, unix.SO_RCVBUF, netlinkReceiveBufferSize)

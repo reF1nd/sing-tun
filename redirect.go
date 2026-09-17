@@ -14,7 +14,6 @@ import (
 const (
 	DefaultAutoRedirectInputMark  = 0x04000000
 	DefaultAutoRedirectOutputMark = 0x08000000
-	DefaultAutoRedirectResetMark  = 0x10000000
 	DefaultAutoRedirectTProxyMark = 0x0c000000
 	DefaultAutoRedirectNFQueue    = 100
 )
@@ -48,9 +47,11 @@ type AutoRedirectOptions struct {
 
 // netd's Fwmark owns bits 0-19 (netId, explicitlySelected, protectedFromVpn,
 // permission) and bit 20 (uidBillingDone, written by the bw_* chains); bits
-// 29-30 are the vendor field and bit 31 is ingress_cpu_wakeup. The mark is also
-// mirrored into the connmark, where netd's StrictController owns bits 24-25.
-const androidReservedMarkMask = 0xE31FFFFF
+// 28-30 are used by OEM/vendor rules (e.g. Xiaomi HyperOS tc_limiter_OUTPUT
+// sets connmark 0x30000000/0x30000000 on wlan0) and bit 31 is
+// ingress_cpu_wakeup. The mark is also mirrored into the connmark, where
+// netd's StrictController owns bits 24-25.
+const androidReservedMarkMask = 0xF31FFFFF
 
 func effectiveMark(value uint32, defaultValue uint32) uint32 {
 	if value == 0 || runtime.GOOS == "android" && value&androidReservedMarkMask != 0 {

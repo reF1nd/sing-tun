@@ -589,8 +589,11 @@ func (r *autoRedirect) setupIPTablesForFamily(family *iptablesFamily) error {
 		inserts = append(inserts, iptablesInsert{iptablesTableNAT, "PREROUTING", []string{"-j", preroutingNAT.name}})
 		if r.androidVPNService {
 			postroutingNAT := r.iptablesChain(family, iptablesTableNAT, r.tableName+"-postrouting")
+			// Cellular QoS rules can overwrite the packet mark in mangle
+			// POSTROUTING before source NAT. Pre-match saves the bypass decision
+			// in the connection mark, which survives those packet mark changes.
 			for _, prefix := range options.Inet4Address {
-				postroutingNAT.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-m", "mark", "--mark", outputMark, "-j", "MASQUERADE")
+				postroutingNAT.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-m", "connmark", "--mark", outputMark, "-j", "MASQUERADE")
 			}
 			if postroutingNAT.err != nil {
 				return postroutingNAT.err

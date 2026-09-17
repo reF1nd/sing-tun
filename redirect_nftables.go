@@ -17,6 +17,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func (r *autoRedirect) includeNFTablesLocalAddress(interfaceName string, address netip.Addr) bool {
+	return isRedirectLocalAddress(interfaceName, address) || (!r.fibAddrType && address.IsLinkLocalUnicast())
+}
+
 func (r *autoRedirect) setupNFTables() error {
 	nft, err := nftables.New()
 	if err != nil {
@@ -35,7 +39,7 @@ func (r *autoRedirect) setupNFTables() error {
 	}
 	r.localAddresses = common.FlatMap(r.interfaceFinder.Interfaces(), func(it control.Interface) []netip.Prefix {
 		return common.Filter(it.Addresses, func(prefix netip.Prefix) bool {
-			return it.Name == "lo" || prefix.Addr().IsGlobalUnicast() || (!r.fibAddrType && prefix.Addr().IsLinkLocalUnicast())
+			return r.includeNFTablesLocalAddress(it.Name, prefix.Addr())
 		})
 	})
 	err = r.nftablesCreateLocalAddressSets(nft, table, r.localAddresses, nil)
@@ -337,7 +341,7 @@ func (r *autoRedirect) nftablesUpdateLocalAddressSet() error {
 	}
 	newLocalAddresses := common.FlatMap(r.interfaceFinder.Interfaces(), func(it control.Interface) []netip.Prefix {
 		return common.Filter(it.Addresses, func(prefix netip.Prefix) bool {
-			return it.Name == "lo" || prefix.Addr().IsGlobalUnicast() || (!r.fibAddrType && prefix.Addr().IsLinkLocalUnicast())
+			return r.includeNFTablesLocalAddress(it.Name, prefix.Addr())
 		})
 	})
 	if slices.Equal(newLocalAddresses, r.localAddresses) {

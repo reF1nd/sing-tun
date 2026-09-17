@@ -66,6 +66,7 @@ type autoRedirect struct {
 	androidVPNServiceRules       []*netlink.Rule
 	androidVPNServiceRulesActive bool
 	androidIngressDiscardValues  map[netip.Addr][8]byte
+	androidTetheringOffload      *androidTetheringOffload
 	dockerFirewallMonitor        *nftables.Monitor
 	dockerFirewallDone           chan struct{}
 }
@@ -195,12 +196,21 @@ func (r *autoRedirect) Start() error {
 		_ = r.Close()
 		return E.Cause(err, "setup iptables")
 	}
+	// Android tethering can forward packets before either CLI or VpnService
+	// redirect rules see them. Only manage filters in the redirect namespace.
+	if r.androidVPNService || (runtime.GOOS == "android" && r.enableIPv6 && r.tunOptions.NetNs == "") {
+		r.androidTetheringOffload = newAndroidTetheringOffload(r.tunOptions, r.enableIPv6, r.logger)
+	}
 	r.registerNetworkCallback(func() {
 		updateErr := r.updateIPTablesNetwork()
 		if updateErr != nil {
 			r.logger.Error(updateErr)
 		}
 	})
+	// Subscribe first so a netd change during the initial dump is revisited.
+	if err = r.updateAndroidTetheringOffload(); err != nil {
+		return E.Errors(E.Cause(err, "setup IPv6 tethering offload compatibility"), r.Close())
+	}
 	return nil
 }
 
@@ -292,6 +302,14 @@ func (r *autoRedirect) initializeBackend() error {
 		}
 	}
 	return nil
+}
+
+// isRedirectLocalAddress reports whether traffic to an interface address is
+// delivered to this host without interception. IPv6 link-local addresses are
+// meaningless to an outbound without their zone, which the redirect server
+// never sees.
+func isRedirectLocalAddress(interfaceName string, address netip.Addr) bool {
+	return interfaceName == "lo" || address.IsGlobalUnicast() || address.Is6() && address.IsLinkLocalUnicast()
 }
 
 func (r *autoRedirect) tproxyEnabled() bool {
@@ -390,6 +408,7 @@ func (r *autoRedirect) updateIPTablesNetwork() error {
 	}
 	var vpnServiceErr error
 	var bypassErr error
+	tetheringErr := r.updateAndroidTetheringOffload()
 	if r.androidVPNService {
 		vpnServiceErr = r.updateAndroidVPNServiceRules()
 		if vpnServiceErr != nil {
@@ -400,7 +419,7 @@ func (r *autoRedirect) updateIPTablesNetwork() error {
 			bypassErr = E.Cause(bypassErr, "update bypass route")
 		}
 	}
-	return E.Errors(err, routeErr, vpnServiceErr, bypassErr)
+	return E.Errors(err, routeErr, vpnServiceErr, bypassErr, tetheringErr)
 }
 
 func (r *autoRedirect) Close() error {
@@ -431,6 +450,7 @@ func (r *autoRedirect) Close() error {
 			r.cleanupBypassRoute()
 			r.cleanupAndroidVPNServiceRules()
 		}
+		err = E.Errors(err, r.cleanupAndroidTetheringOffload())
 	}
 	if r.nfqueueHandler != nil {
 		r.nfqueueHandler.Close()
@@ -486,10 +506,12 @@ func (r *autoRedirect) redirectPort() uint16 {
 // netd (server/RouteController.cpp) identifies a network's route table as
 // ifindex + ROUTE_TABLE_OFFSET_FROM_INDEX, selects VPN traffic with the
 // secure (fwmark 0x0/0x20000) and bypassable (fwmark 0x0/0x30000) uid range
-// rules, the local network with a rule matching fwmark 0x0/0x10000, and the
-// default network with a rule matching fwmark 0x0/0xffff without a uid range.
+// rules, local networks with rules at RULE_PRIORITY_LOCAL_NETWORK matching
+// fwmark 0x0/0x10000, and the default network with a rule matching fwmark
+// 0x0/0xffff without a uid range.
 const (
 	androidRouteTableOffsetFromIndex = 1000
+	androidLocalNetworkRulePriority  = 20000
 	androidExplicitSelectMask        = 0x10000
 	androidSecureVPNMask             = 0x20000
 	androidBypassableVPNMask         = 0x30000
